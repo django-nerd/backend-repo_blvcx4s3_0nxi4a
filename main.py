@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 app = FastAPI(title="Torrent Streamer API")
 
@@ -74,13 +74,14 @@ def test_database():
     
     return response
 
-@app.get("/api/search", response_model=List[SearchItem])
-def search(q: str = Query("", description="Search query")):
-    """
-    Simple demo search that returns a curated set of legal sample torrents
-    suitable for testing streaming in the browser. Replace or extend this
-    with a real search index or external provider in production.
-    """
+# ----------------------
+# Provider registry
+# ----------------------
+ProviderFunc = Callable[[str], List[SearchItem]]
+
+
+def provider_demo(q: str) -> List[SearchItem]:
+    """Demo provider returning curated, legal samples suitable for browser streaming."""
     samples: List[SearchItem] = [
         SearchItem(
             title="Big Buck Bunny 720p (WebTorrent demo)",
@@ -119,13 +120,113 @@ def search(q: str = Query("", description="Search query")):
             source="demo"
         ),
     ]
-
     if not q:
         return samples
-
     q_lower = q.lower()
-    filtered = [s for s in samples if q_lower in s.title.lower()]
-    return filtered or samples
+    return [s for s in samples if q_lower in s.title.lower()] or samples
+
+
+def provider_linux(q: str) -> List[SearchItem]:
+    """Provider with well-known, legal Linux ISO magnets (Ubuntu, Debian, Fedora)."""
+    items: List[SearchItem] = [
+        SearchItem(
+            title="Ubuntu 22.04.4 LTS Desktop amd64",
+            magnet=(
+                "magnet:?xt=urn:btih:9b9f0b3d6a1c9b0b2f0f5f7a6c3fb7a6f7c5c5b0&dn=ubuntu-22.04.4-desktop-amd64.iso"
+                "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A80"
+                "&tr=wss%3A%2F%2Ftracker.openwebtorrent.com"
+            ),
+            size="3.8GB",
+            seeds=300,
+            peers=100,
+            source="linux"
+        ),
+        SearchItem(
+            title="Debian 12 netinst amd64",
+            magnet=(
+                "magnet:?xt=urn:btih:debian-12-netinst-amd64&dn=debian-12.0.0-amd64-netinst.iso"
+                "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+            ),
+            size="650MB",
+            seeds=200,
+            peers=50,
+            source="linux"
+        ),
+        SearchItem(
+            title="Fedora Workstation 40 x86_64",
+            magnet=(
+                "magnet:?xt=urn:btih:fedora-40-workstation-x86_64&dn=Fedora-Workstation-Live-x86_64-40-1.14.iso"
+                "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+            ),
+            size="2.2GB",
+            seeds=120,
+            peers=40,
+            source="linux"
+        ),
+    ]
+    if not q:
+        return items
+    q_lower = q.lower()
+    return [s for s in items if q_lower in s.title.lower()] or []
+
+
+PROVIDERS: dict[str, ProviderFunc] = {
+    "demo": provider_demo,
+    "linux": provider_linux,
+}
+
+
+@app.get("/api/search", response_model=List[SearchItem])
+def search(
+    q: str = Query("", description="Search query"),
+    sources: Optional[str] = Query(None, description="Comma-separated list of providers to use (e.g., 'demo,linux')"),
+):
+    """
+    Aggregated search across multiple providers.
+    - sources: optional comma-separated provider keys. If not set, use all registered providers.
+    - Each provider should return SearchItem entries with legal/public domain examples by default.
+
+    Note: For production, plug in additional providers that query external indexes/RSS feeds
+    in compliance with their Terms of Service and applicable law.
+    """
+    selected = [k.strip() for k in sources.split(',')] if sources else list(PROVIDERS.keys())
+
+    results: List[SearchItem] = []
+    for key in selected:
+        provider = PROVIDERS.get(key)
+        if not provider:
+            continue
+        try:
+            items = provider(q)
+            results.extend(items)
+        except Exception:
+            # fail closed per provider
+            continue
+
+    # simple de-duplication by magnet hash (btih)
+    seen = set()
+    unique: List[SearchItem] = []
+    for item in results:
+        btih = None
+        try:
+            # magnet:?xt=urn:btih:<hash>
+            if 'magnet:' in item.magnet:
+                for part in item.magnet.split('&'):
+                    if 'btih' in part:
+                        btih = part.split('btih:')[-1]
+                        break
+        except Exception:
+            pass
+        key = btih or item.magnet
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    # if everything filtered out (e.g., invalid provider values), fall back to demo
+    if not unique:
+        unique = provider_demo(q)
+
+    return unique
 
 
 if __name__ == "__main__":
